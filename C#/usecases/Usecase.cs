@@ -18,7 +18,7 @@ namespace MonitorCS.Usecases {
 
     public Dictionary<string, object> execute(Dictionary<string, object> arguments) {
       try {
-        string webAddr="http://localhost:4567/usecase";
+        var webAddr="http://localhost:4567/usecase";
 
         var httpWebRequest = (HttpWebRequest)WebRequest.Create(webAddr);
         httpWebRequest.ContentType = "application/json";
