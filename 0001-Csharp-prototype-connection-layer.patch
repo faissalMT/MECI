@@ -1,0 +1,206 @@
+From a2c3ffc58ea315d271cdd3c65eb54e5aa7c6b4fb Mon Sep 17 00:00:00 2001
+From: Faissal Bensefia <faissal@madetech.com>
+Date: Tue, 14 May 2019 14:17:08 +0100
+Subject: [PATCH] Csharp prototype connection layer
+
+---
+ docker-compose.yml                            |  9 ++++
+ lib/delivery_mechanism/controllers/MECI.rb    | 50 ++++++++++++++++++
+ .../controllers/get_user_projects.rb          |  4 ++
+ lib/dependency_factory.rb                     | 52 ++++++++++++++++++-
+ lib/homes_england/use_cases.rb                |  3 +-
+ 5 files changed, 115 insertions(+), 3 deletions(-)
+ create mode 100644 lib/delivery_mechanism/controllers/MECI.rb
+
+diff --git a/docker-compose.yml b/docker-compose.yml
+index ba4f0551..e6b3cc11 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -1,5 +1,14 @@
+ version: "3"
+ services:
++  cs:
++    #dockerfile: monitor-cs/cs/Dockerfile
++    build: monitor-cs/cs
++    volumes:
++      - ./monitor-cs/cs:/app
++      - /app/build
++    ports:
++      - "5001:5001"
++      - "5000:5000"
+   db:
+     image: postgres:9.4.18-alpine
+     environment:
+diff --git a/lib/delivery_mechanism/controllers/MECI.rb b/lib/delivery_mechanism/controllers/MECI.rb
+new file mode 100644
+index 00000000..e92f11a6
+--- /dev/null
++++ b/lib/delivery_mechanism/controllers/MECI.rb
+@@ -0,0 +1,50 @@
++require_relative '../web_routes.rb'
++
++DeliveryMechanism::WebRoutes.post '/usecase' do
++  usecaseRequest = get_hash(request)
++  @dependency_factory.get_use_case(usecaseRequest[:usecase].to_sym).execute(usecaseRequest[:arguments]).to_json
++end
++
++DeliveryMechanism::WebRoutes.post '/gateway' do
++  gatewayRequest = get_hash(request)
++  parsedgatewayArguments = gatewayRequest[:arguments].map do |argument|
++    if argument.class == Array
++      argument.map do |i|
++        convert_json_to_domain(i)
++      end
++    elsif argument.has_key?(:$domain)
++      convert_json_to_domain(argument)
++    else
++      argument
++    end
++  end
++
++  return_object = @dependency_factory.get_gateway(gatewayRequest[:gateway].to_sym).send(gatewayRequest[:method].to_sym, *parsedgatewayArguments)
++  return_object_name = return_object.class.to_s
++
++  #Generalise this to deal with nesting better
++  if return_object.class == Array
++    return_object.map do |i|
++      convert_domain_to_json(i, i.class.to_s)
++    end.to_json
++  elsif return_object_name.include? "Domain"
++    convert_domain_to_json(return_object, return_object_name).to_json
++  else
++    return_object.to_s
++  end
++end
++
++def convert_json_to_domain(json_domain)
++  domain_object = Kernel.const_get(json_domain[:$domain]).new
++  json_domain.each do |key, value|
++    next if key == :$domain
++    domain_object.instance_variable_set("@#{key}".to_sym, value)
++  end
++  domain_object
++end
++
++def convert_domain_to_json(domain_object, domain_object_name)
++  hashed_domain_object = domain_object.instance_variables.each_with_object({}) { |var, hash| hash[var.to_s.delete("@")] = domain_object.instance_variable_get(var) }
++  hashed_domain_object[:$domain] = domain_object_name
++  hashed_domain_object
++end
+diff --git a/lib/delivery_mechanism/controllers/get_user_projects.rb b/lib/delivery_mechanism/controllers/get_user_projects.rb
+index 805ed752..1e0ee2bd 100644
+--- a/lib/delivery_mechanism/controllers/get_user_projects.rb
++++ b/lib/delivery_mechanism/controllers/get_user_projects.rb
+@@ -1,11 +1,15 @@
+ require_relative '../web_routes.rb'
+ 
++$stdout.sync = true
++
+ DeliveryMechanism::WebRoutes.get '/user/projects' do
+   guard_access env, params, request do |_, user_info|
+     project_list = @dependency_factory
+       .get_use_case(:get_user_projects)
+       .execute(email: user_info[:email])[:project_list]
+ 
++    p @dependency_factory.get_use_case(:get_project_users).execute(project_id: 1)
++
+     content_type 'application/json'
+     response.body = {
+       project_list: project_list
+diff --git a/lib/dependency_factory.rb b/lib/dependency_factory.rb
+index 0694b012..65c5772a 100644
+--- a/lib/dependency_factory.rb
++++ b/lib/dependency_factory.rb
+@@ -1,5 +1,43 @@
+ require 'dry/container'
+ 
++class CSUsecase
++  def initialize(usecase)
++    @usecase = usecase
++  end
++
++  def execute(arguments)
++    monitor_cs = URI("http://cs:5000")
++    use_ssl = monitor_cs.scheme == 'https'
++    Net::HTTP.start(monitor_cs.host, monitor_cs.port, use_ssl: use_ssl) do |http|
++      request = Net::HTTP::Post.new("/usecase")
++      request.body = { usecase: @usecase, arguments: arguments}.to_json
++      response = http.request(request)
++      if response.kind_of?(Net::HTTPSuccess)
++        Common::DeepSymbolizeKeys.to_symbolized_hash(JSON.parse(response.body))
++      end
++    end
++  end
++end
++
++class CSGateway
++  def initialize(gateway)
++    @usecase = gateway
++  end
++
++  def method_missing(method, *arguments)
++      monitor_cs = URI("http://cs:5000")
++      use_ssl = monitor_cs.scheme == 'https'
++      Net::HTTP.start(monitor_cs.host, monitor_cs.port, use_ssl: use_ssl) do |http|
++        request = Net::HTTP::Post.new("/gateway")
++        request.body = { gateway: @gateway, method: method, arguments: arguments}.to_json
++        response = http.request(request)
++        if response.kind_of?(Net::HTTPSuccess)
++          Common::DeepSymbolizeKeys.to_symbolized_hash(JSON.parse(response.body))
++        end
++      end
++  end
++end
++
+ class DependencyFactory
+   attr_accessor :database
+ 
+@@ -29,14 +67,24 @@ class DependencyFactory
+   end
+ 
+   def get_use_case(use_case)
++    begin
++      usecase = @use_case_container.resolve(use_case)
++    rescue Exception
++      usecase = CSUsecase.new(use_case)
++    end
++
+     Common::Proxy::Logging.new(
+       logger: @logger,
+-      use_case: @use_case_container.resolve(use_case)
++      use_case: usecase
+     )
+   end
+ 
+   def get_gateway(gateway)
+-    @gateway_container.resolve(gateway)
++    begin
++      @gateway_container.resolve(gateway)
++    rescue
++      CSGateway.new(gateway)
++    end
+   end
+ 
+   def setup_logger
+diff --git a/lib/homes_england/use_cases.rb b/lib/homes_england/use_cases.rb
+index 8d8adeed..8eebc7e8 100644
+--- a/lib/homes_england/use_cases.rb
++++ b/lib/homes_england/use_cases.rb
+@@ -79,12 +79,13 @@ class HomesEngland::UseCases
+         project_gateway: builder.get_gateway(:project)
+       )
+     end
+-
++=begin
+     builder.define_use_case :get_project_users do
+       HomesEngland::UseCase::GetProjectUsers.new(
+         user_gateway: builder.get_gateway(:users)
+       )
+     end
++=end
+ 
+     builder.define_use_case :send_project_creation_notification do
+       HomesEngland::UseCase::SendProjectCreationNotification.new(
+-- 
+2.17.1
+
